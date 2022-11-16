@@ -1,0 +1,15 @@
+# Virtualenv
+bin/*
+lib/*
+pyvenv.cfg
+
+# Python execution cache
+*/__pycache__
+
+# text datasets
+data/*.json
+
+# model checkpoints
+checkpoints
+! checkpoints/*/train.log
+! checkpoints/*/eval.log

@@ -1,0 +1,6 @@
+tqdm
+
+torch
+sentencepiece
+
+bleu
