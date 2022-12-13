@@ -41,7 +41,7 @@ def main(args):
     file_handler.setFormatter(formatter)
     logger = logging.getLogger('')
     logger.addHandler(stdout_handler)
-    logger.addHandler(file_handler)
+    # logger.addHandler(file_handler)
     logger.setLevel(logging.INFO)
 
     # Log basic info
@@ -53,51 +53,57 @@ def main(args):
     # Load tokenizer
     tokenizer = spm.SentencePieceProcessor()
     tokenizer.LoadFromFile(args.spm_file)
-    
-    # Load model
-    model_load_path = model_store_path
-    assert os.path.isdir(model_load_path)
-    last_checkpoint = sorted([f for f in os.listdir(model_load_path) if f.endswith(".pt")], reverse=True)[0]
-    model_load_path = os.path.join(model_load_path, last_checkpoint)
 
-    model = KorCorrModel(
-        vocab_size=tokenizer.piece_size(),
-        label_size=3,
-        hidden_dim=args.hidden_dim,
-        encoder_layers=args.encoder_layers,
-        encoder_heads=args.encoder_heads,
-        encoder_pf_dim=args.encoder_pf_dim,
-        encoder_dropout=args.encoder_dropout, 
-        decoder_layers=args.decoder_layers,
-        decoder_heads=args.decoder_heads,
-        decoder_pf_dim=args.decoder_pf_dim,
-        decoder_dropout=args.decoder_dropout,
-        pad_idx=tokenizer.pad_id(),
-        bos_idx=tokenizer.bos_id(),
-        eos_idx=tokenizer.eos_id(),
-        max_length=args.max_length,
-        device=device
-    ).to(device)
-    model.load_state_dict(torch.load(model_load_path))
-    model.device = device
-    model = model.to(device)
+    if args.eval_from_file is None:        
+        # Load model
+        model_load_path = model_store_path
+        assert os.path.isdir(model_load_path)
+        last_checkpoint = sorted([f for f in os.listdir(model_load_path) if f.endswith(".pt")], reverse=True)[0]
+        model_load_path = os.path.join(model_load_path, last_checkpoint)
+
+        model = KorCorrModel(
+            vocab_size=tokenizer.piece_size(),
+            label_size=3,
+            hidden_dim=args.hidden_dim,
+            encoder_layers=args.encoder_layers,
+            encoder_heads=args.encoder_heads,
+            encoder_pf_dim=args.encoder_pf_dim,
+            encoder_dropout=args.encoder_dropout, 
+            decoder_layers=args.decoder_layers,
+            decoder_heads=args.decoder_heads,
+            decoder_pf_dim=args.decoder_pf_dim,
+            decoder_dropout=args.decoder_dropout,
+            pad_idx=tokenizer.pad_id(),
+            bos_idx=tokenizer.bos_id(),
+            eos_idx=tokenizer.eos_id(),
+            max_length=args.max_length,
+            use_seqcls_decoding=args.use_seqcls_decoding,
+            device=device
+        ).to(device)
+        model.load_state_dict(torch.load(model_load_path))
+        model.device = device
+        model = model.to(device)
+        model.eval()
+    else:
+        with open(args.eval_from_file, "r", encoding="UTF-8") as file:
+            eval_data = json.load(file)
 
     # Load data
     logger.info("Generating dataset...")
     with open(args.test_data, "r", encoding='UTF-8') as file:
         test_data = json.load(file)
-    print(len(test_data))
     test_dataset = CorrectionDataset(test_data, tokenizer, max_length=args.max_length)
-    print(len(test_dataset))
     test_loader = DataLoader(test_dataset, shuffle=False, batch_size=args.batch_size, collate_fn=test_dataset.collate)
     logger.info("Done")
 
     # Define criteria and optimizer
     gen_criteria = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_id())
-    label_criteria = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_id())
+    def label_criteria(input, target, mask):
+        loss = F.cross_entropy(input, target, reduction="none")
+        loss *= mask
+        return torch.sum(loss) / torch.sum(mask) # Mean averaging
 
     # Eval phase (on dev set)
-    model.eval()
     total = len(test_dataset)
     dev_loss = 0
 
@@ -105,24 +111,41 @@ def main(args):
     outputs = []
     goldens = []
 
+    label_total = 0
+    label_correct = 0
+
     for original_data in test_dataset.data:
         inputs.append(original_data["form_str"])
-        goldens.append(original_data["corrected_form_str"])
-    print(len(inputs), len(goldens))
-    with torch.no_grad():
-        for batch in tqdm(test_loader):
-            before, after, labels = batch
-            before = before.to(device)
-            after = after.to(device)
-            labels = labels.to(device)
-            # forward + backward + optimize
-            output_labels, output_generation = model(before, after[:, :-1])
-            loss = gen_criteria(output_generation.transpose(1, 2), after[:, 1:])
-            if args.use_label_loss:
-                loss += label_criteria(output_labels, labels[:-1])
-            dev_loss += loss
+        goldens.append(unicodedata.normalize('NFKC', original_data["corrected_form_str"]))
+    if args.eval_from_file is None:
+        with torch.no_grad():
+            for batch in tqdm(test_loader):
+                before, after, labels = batch
+                before = before.to(device)
+                after = after.to(device)
+                labels = labels.to(device)
+                # forward + backward + optimize
+                output_labels, output_generation = model(before, after[:, :-1])
+                loss = gen_criteria(output_generation.transpose(1, 2), after[:, 1:])
+                if args.use_label_loss:
+                    mask = (before!=tokenizer.pad_id()) * (before!=tokenizer.eos_id()) * (before!=tokenizer.bos_id())
+                    loss += label_criteria(output_labels.transpose(1, 2), labels, mask)
+                    label_total += torch.sum(mask).item()
+                    output_labels = torch.argmax(output_labels, dim=2)
+                    label_correct += torch.sum((output_labels == labels) * mask).item()
+                dev_loss += loss
 
-            outputs.extend(tokenizer.Decode(model.generate(before).tolist()))
+                outputs.extend(tokenizer.Decode(model.generate(before).tolist()))
+    else:
+        assert len(inputs) <= len(eval_data)
+        eval_it = iter(eval_data)
+        for i in inputs:
+            while True:
+                x = next(eval_it)
+                if x["form"] == i:
+                    break
+            outputs.append(unicodedata.normalize('NFKC', x["corrected_form"]))
+        assert len(inputs) == len(outputs)
     
     # bleu score
     nonl_goldens = [s.replace("\n", " ") for s in goldens]
@@ -136,7 +159,6 @@ def main(args):
         "corrected_form": o
     } for i, o in zip(inputs, outputs)]
     test_result_dataset = CorrectionDataset(test_result_data, tokenizer, max_length=args.max_length, filter_result_length=False)
-    print(len(test_result_data), len(test_result_dataset))
     assert len(test_result_dataset) == len(test_dataset)
 
     # word precision, recall, F1
@@ -145,8 +167,6 @@ def main(args):
     word_false_negative = 0
     for i in range(len(test_dataset)):
         guess, goal = test_result_dataset[i], test_dataset[i]
-        if guess["form_str"] != goal["form_str"]:
-            print(guess["form_str"], "||", goal["form_str"])
         assert guess["form_str"] == goal["form_str"]
         tp_count = 0
         for token in guess["corrected_form_str"].split():
@@ -198,19 +218,23 @@ def main(args):
     logger.info(f"  precision = {token_precision * 100}")
     logger.info(f"  recall = {token_recall * 100}")
     logger.info(f"  F1 = {token_f1 * 100}")
-    logger.info(f"Label accuracy = {accurate_labels / total_labels * 100}")
+    logger.info(f"Label accuracy(generation) = {accurate_labels / total_labels * 100}")
+    if args.use_label_loss:
+        logger.info(f"Label accuracy(classification) = {label_correct / label_total * 100}")
     logger.info("")
     logger.info("Test generation result")
     for i in range(10):
         logger.info(f"Example {i}")
         logger.info(f"    input: {inputs[i]}")
         logger.info(f"    output: {outputs[i]}")
+        logger.info(f"    golden: {goldens[i]}")
     logger.info("")
 
 if __name__ == "__main__":
     parser = ArgumentParser()
     # Dataset
     parser.add_argument("--test_data", required=True)
+    parser.add_argument("--eval_from_file", default=None)
 
     # Tokenizer
     parser.add_argument("--spm_file", required=True)
@@ -228,6 +252,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_length", type=int, default=512)
 
     parser.add_argument("--use_label_loss", action="store_true", default=False)
+    parser.add_argument("--use_seqcls_decoding", action="store_true", default=False)
 
     # Training args
     parser.add_argument("--torch_seed", type=int, default=0)

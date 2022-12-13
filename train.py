@@ -71,6 +71,7 @@ def main(args):
         bos_idx=tokenizer.bos_id(),
         eos_idx=tokenizer.eos_id(),
         max_length=args.max_length,
+        use_seqcls_decoding=args.use_seqcls_decoding,
         device=device
     ).to(device)
     # if args.from_checkpoint is not None:
@@ -196,6 +197,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_length", type=int, default=512)
 
     parser.add_argument("--use_label_loss", action="store_true", default=False)
+    parser.add_argument("--use_seqcls_decoding", action="store_true", default=False)
 
     # Training args
     parser.add_argument("--torch_seed", type=int, default=0)
